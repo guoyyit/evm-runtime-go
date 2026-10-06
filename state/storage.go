@@ -39,6 +39,28 @@ type Store interface {
 	Close() error
 }
 
+// AccountDelta describes the changes one execution made to a single account,
+// relative to the committed state that execution started from. Balance and
+// nonce are signed deltas so concurrent executions merging into the same
+// account never lose updates; code and storage are absolute values where the
+// last committer wins, exactly as if the commits had run serially.
+type AccountDelta struct {
+	BalanceDelta *big.Int
+	NonceDelta   int64
+	CodeSet      bool
+	Code         []byte
+	// Storage carries the absolute post-execution values of the slots this
+	// execution wrote; a zero hash deletes the slot on merge.
+	Storage map[common.Hash]common.Hash
+}
+
+// DeltaCommitter is an optional Store capability: the store applies the
+// given deltas onto the latest committed state atomically. Stores that do
+// not implement it receive absolute account replacements via Store.Commit.
+type DeltaCommitter interface {
+	CommitDelta(accounts map[common.Address]*AccountDelta, suicides map[common.Address]struct{}, logs []Log) (int, error)
+}
+
 // FileStore persists the world state to a single JSON document on local disk.
 type FileStore struct {
 	mu   sync.Mutex
@@ -85,18 +107,7 @@ func (f *FileStore) Commit(accounts map[common.Address]*PersistedAccount, suicid
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	newRevision := f.data.Revision + 1
-
-	next := persistedData{
-		Revision: newRevision,
-		Accounts: make(map[common.Address]PersistedAccount, len(f.data.Accounts)+len(accounts)),
-		Logs:     append(append([]Log(nil), f.data.Logs...), logs...),
-	}
-	for addr, acc := range f.data.Accounts {
-		copied := acc
-		copied.Storage = copyStorage(acc.Storage)
-		next.Accounts[addr] = copied
-	}
+	next := f.nextLocked(logs)
 	for addr, acc := range accounts {
 		current := next.Accounts[addr]
 		merged := *acc
@@ -116,7 +127,88 @@ func (f *FileStore) Commit(accounts map[common.Address]*PersistedAccount, suicid
 	for addr := range suicides {
 		delete(next.Accounts, addr)
 	}
+	return f.persistLocked(next)
+}
 
+// CommitDelta atomically applies per-account deltas onto the latest
+// committed state. Balance and nonce deltas commute, so the merged result
+// equals any serial execution of the same commits; storage slots merge per
+// key with the last committer winning, again matching serial commit order.
+func (f *FileStore) CommitDelta(accounts map[common.Address]*AccountDelta, suicides map[common.Address]struct{}, logs []Log) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	next := f.nextLocked(logs)
+	for addr, d := range accounts {
+		current := next.Accounts[addr]
+
+		balance := new(big.Int)
+		if current.Balance != "" {
+			if _, ok := balance.SetString(current.Balance, 10); !ok {
+				return f.data.Revision, fmt.Errorf("state: corrupt committed balance for %s", addr.Hex())
+			}
+		}
+		if d.BalanceDelta != nil {
+			balance.Add(balance, d.BalanceDelta)
+		}
+		if balance.Sign() < 0 {
+			return f.data.Revision, fmt.Errorf("state: merged balance for %s would go negative", addr.Hex())
+		}
+		nonce := int64(current.Nonce) + d.NonceDelta
+		if nonce < 0 {
+			return f.data.Revision, fmt.Errorf("state: merged nonce for %s would go negative", addr.Hex())
+		}
+
+		merged := current
+		merged.Balance = balance.String()
+		merged.Nonce = uint64(nonce)
+		if d.CodeSet {
+			if len(d.Code) == 0 {
+				merged.Code = nil
+				merged.CodeHash = common.Hash{}
+			} else {
+				merged.Code = append([]byte(nil), d.Code...)
+				merged.CodeHash = common.Keccak256Hash(d.Code)
+			}
+		}
+		if len(d.Storage) > 0 {
+			slots := copyStorage(current.Storage)
+			for k, v := range d.Storage {
+				if v == (common.Hash{}) {
+					delete(slots, k.Hex())
+					continue
+				}
+				slots[k.Hex()] = v.Hex()
+			}
+			merged.Storage = slots
+		}
+		next.Accounts[addr] = merged
+	}
+	for addr := range suicides {
+		delete(next.Accounts, addr)
+	}
+	return f.persistLocked(next)
+}
+
+// nextLocked starts a new revision carrying over every committed account and
+// appending the given logs. The caller holds f.mu.
+func (f *FileStore) nextLocked(logs []Log) persistedData {
+	next := persistedData{
+		Revision: f.data.Revision + 1,
+		Accounts: make(map[common.Address]PersistedAccount, len(f.data.Accounts)),
+		Logs:     append(append([]Log(nil), f.data.Logs...), logs...),
+	}
+	for addr, acc := range f.data.Accounts {
+		copied := acc
+		copied.Storage = copyStorage(acc.Storage)
+		next.Accounts[addr] = copied
+	}
+	return next
+}
+
+// persistLocked atomically writes next to disk and swaps it in. The caller
+// holds f.mu.
+func (f *FileStore) persistLocked(next persistedData) (int, error) {
 	encoded, err := json.MarshalIndent(&next, "", "  ")
 	if err != nil {
 		return f.data.Revision, fmt.Errorf("state: encode state: %w", err)
@@ -143,7 +235,7 @@ func (f *FileStore) Commit(accounts map[common.Address]*PersistedAccount, suicid
 		return f.data.Revision, fmt.Errorf("state: atomic rename: %w", err)
 	}
 	f.data = next
-	return newRevision, nil
+	return next.Revision, nil
 }
 
 func (f *FileStore) Revision() int {
@@ -169,4 +261,4 @@ func copyStorage(in map[string]string) map[string]string {
 func (f *FileStore) Close() error { return nil }
 
 var _ Store = (*FileStore)(nil)
-var _ = big.NewInt
+var _ DeltaCommitter = (*FileStore)(nil)

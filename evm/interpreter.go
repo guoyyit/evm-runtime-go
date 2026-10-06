@@ -30,6 +30,8 @@ func (in *Interpreter) Run(contract *Contract, input []byte, readOnly bool) (ret
 	defer func() {
 		if r := recover(); r != nil {
 			if e, ok := r.(error); ok {
+				// An exceptional halt consumes the frame's remaining gas.
+				contract.Gas = 0
 				err = &Error{Err: e}
 				return
 			}
@@ -40,24 +42,33 @@ func (in *Interpreter) Run(contract *Contract, input []byte, readOnly bool) (ret
 	code := contract.Code
 	pc := 0
 
-	for {
+	// fail reports an exceptional halt: the frame's remaining gas is
+	// consumed, unlike REVERT which returns the unused gas to the caller.
+	fail := func(err error, pc int, op OpCode) ([]byte, error) {
+		contract.Gas = 0
+		return nil, &Error{Err: err, PC: uint64(pc), Op: op}
+	}
+
+	// Running past the last instruction is a legal implicit STOP: the frame
+	// halts successfully with empty output, exactly like an explicit STOP.
+	for pc < len(code) {
 		op := OpCode(code[pc])
 
 		// Static gas and stack validation happen before memory expansion.
 		info := opcodeInfo(op)
 		if info.pops < 0 {
-			return nil, &Error{Err: ErrInvalidOpcode, PC: uint64(pc), Op: op}
+			return fail(ErrInvalidOpcode, pc, op)
 		}
 		if err := in.stack.require(info.pops, info.pushes); err != nil {
-			return nil, &Error{Err: err, PC: uint64(pc), Op: op}
+			return fail(err, pc, op)
 		}
 		if err := in.chargeStatic(contract, op, pc); err != nil {
-			return nil, &Error{Err: err, PC: uint64(pc), Op: op}
+			return fail(err, pc, op)
 		}
 
 		// Memory-expanding operations charge for the new size up front.
 		if err := in.chargeMemory(contract, op); err != nil {
-			return nil, &Error{Err: err, PC: uint64(pc), Op: op}
+			return fail(err, pc, op)
 		}
 
 		if op.IsPush() {
@@ -78,20 +89,21 @@ func (in *Interpreter) Run(contract *Contract, input []byte, readOnly bool) (ret
 
 		nextPC, halted, out, runErr := in.execute(contract, op, pc)
 		if runErr != nil {
-			evmErr := &Error{Err: runErr, PC: uint64(pc), Op: op}
 			if rev, ok := runErr.(*revertError); ok {
-				evmErr.Err = ErrExecutionReverted
-				evmErr.RevertData = rev.data
-				// REVERT returns its payload even though the frame fails.
+				// REVERT returns its payload and keeps the remaining gas.
+				evmErr := &Error{Err: ErrExecutionReverted, PC: uint64(pc), Op: op, RevertData: rev.data}
 				return rev.data, evmErr
 			}
-			return nil, evmErr
+			return fail(runErr, pc, op)
 		}
 		if halted {
 			return out, nil
 		}
 		pc = nextPC
 	}
+	// Implicit termination: the program counter walked off the end of the
+	// bytecode. Treat as STOP — success with no return data.
+	return nil, nil
 }
 
 // useGas deducts amount from the frame gas budget.

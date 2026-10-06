@@ -98,10 +98,12 @@ func (r *Runtime) Execute(cfg Config) (*Result, error) {
 	result.GasUsed = cfg.GasLimit - left
 
 	if runErr != nil {
+		// Report the gas actually consumed, never a blanket budget cap:
+		// REVERT returns the unused gas, exceptional halts consume the
+		// frame's remaining gas, and pre-execution failures (insufficient
+		// balance, depth limit) consume nothing at all.
 		result.Failed = true
 		result.Err = runErr
-		result.GasUsed = cfg.GasLimit
-		result.GasLeft = 0
 		result.ReturnData = evm.RevertData(runErr)
 		// Discard the working state entirely; nothing is committed.
 		return result, nil
@@ -143,8 +145,6 @@ func (r *Runtime) Query(cfg Config) (*Result, error) {
 	if runErr != nil {
 		result.Failed = true
 		result.Err = runErr
-		result.GasUsed = cfg.GasLimit
-		result.GasLeft = 0
 		result.ReturnData = evm.RevertData(runErr)
 	}
 	return result, nil

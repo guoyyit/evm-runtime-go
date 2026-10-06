@@ -21,6 +21,12 @@ type StateDB struct {
 	code          map[common.Address][]byte
 	originStorage map[common.Address]map[common.Hash]common.Hash
 
+	// baseBalances/baseNonces record the committed values this execution
+	// started from, so Commit can express balance and nonce changes as
+	// deltas that merge loss-free with concurrent commits.
+	baseBalances map[common.Address]*big.Int
+	baseNonces   map[common.Address]uint64
+
 	accessList map[common.Address]map[common.Hash]struct{}
 	logs       []Log
 
@@ -52,6 +58,8 @@ func NewStateDB(store Store) (*StateDB, error) {
 		storage:         make(map[common.Address]map[common.Hash]common.Hash),
 		code:            make(map[common.Address][]byte),
 		originStorage:   make(map[common.Address]map[common.Hash]common.Hash),
+		baseBalances:    make(map[common.Address]*big.Int),
+		baseNonces:      make(map[common.Address]uint64),
 		accessList:      make(map[common.Address]map[common.Hash]struct{}),
 		suicides:        make(map[common.Address]bool),
 		touchedAccounts: make(map[common.Address]struct{}),
@@ -63,6 +71,8 @@ func NewStateDB(store Store) (*StateDB, error) {
 			return nil, fmt.Errorf("state: invalid balance for %s: %q", addr.Hex(), pa.Balance)
 		}
 		s.accounts[addr] = &Account{Nonce: pa.Nonce, Balance: bal, CodeHash: pa.CodeHash}
+		s.baseBalances[addr] = new(big.Int).Set(bal)
+		s.baseNonces[addr] = pa.Nonce
 		if len(pa.Code) > 0 {
 			s.code[addr] = pa.Code
 		}
@@ -95,10 +105,68 @@ func (s *StateDB) Revert(id int) {
 }
 
 // Commit atomically persists pending changes and returns the new logs.
+// Balance and nonce changes are expressed as deltas relative to the state
+// this execution loaded, so concurrent executions committing to the same
+// account never lose updates; stores without delta support fall back to
+// absolute commits.
 func (s *StateDB) Commit() ([]Log, error) {
 	if !s.valid {
 		return nil, nil
 	}
+	logs := append([]Log(nil), s.logs...)
+	suicides := make(map[common.Address]struct{}, len(s.suicides))
+	for addr, yes := range s.suicides {
+		if yes {
+			suicides[addr] = struct{}{}
+		}
+	}
+
+	var err error
+	if dc, ok := s.store.(DeltaCommitter); ok {
+		_, err = dc.CommitDelta(s.buildDeltas(), suicides, s.logs)
+	} else {
+		_, err = s.store.Commit(s.buildAbsolute(), suicides, s.logs)
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.valid = false
+	return logs, nil
+}
+
+// buildDeltas expresses every touched account as a change relative to the
+// base state loaded by this StateDB.
+func (s *StateDB) buildDeltas() map[common.Address]*AccountDelta {
+	dirtyCode := s.codeDirtyAccounts()
+	out := make(map[common.Address]*AccountDelta, len(s.touchedAccounts))
+	for addr := range s.touchedAccounts {
+		acc := s.accounts[addr]
+		if s.suicides[addr] {
+			continue
+		}
+		d := &AccountDelta{
+			BalanceDelta: new(big.Int).Sub(acc.Balance, s.baseBalance(addr)),
+			NonceDelta:   int64(acc.Nonce) - int64(s.baseNonce(addr)),
+		}
+		if dirtyCode[addr] {
+			d.CodeSet = true
+			d.Code = s.code[addr]
+		}
+		if touched := s.touchedSlots[addr]; len(touched) > 0 {
+			d.Storage = make(map[common.Hash]common.Hash, len(touched))
+			for k := range touched {
+				// A zero value explicitly clears the committed slot.
+				d.Storage[k] = s.storage[addr][k]
+			}
+		}
+		out[addr] = d
+	}
+	return out
+}
+
+// buildAbsolute renders every touched account as a full replacement record
+// (legacy path for stores without delta support).
+func (s *StateDB) buildAbsolute() map[common.Address]*PersistedAccount {
 	out := make(map[common.Address]*PersistedAccount, len(s.touchedAccounts))
 	for addr := range s.touchedAccounts {
 		acc := s.accounts[addr]
@@ -124,18 +192,30 @@ func (s *StateDB) Commit() ([]Log, error) {
 		}
 		out[addr] = pa
 	}
-	logs := append([]Log(nil), s.logs...)
-	suicides := make(map[common.Address]struct{}, len(s.suicides))
-	for addr, yes := range s.suicides {
-		if yes {
-			suicides[addr] = struct{}{}
+	return out
+}
+
+// codeDirtyAccounts reports which accounts have a surviving (not reverted)
+// code change in the journal.
+func (s *StateDB) codeDirtyAccounts() map[common.Address]bool {
+	dirty := make(map[common.Address]bool)
+	for _, e := range s.journal.entries {
+		if cc, ok := e.(codeChange); ok {
+			dirty[cc.account] = true
 		}
 	}
-	if _, err := s.store.Commit(out, suicides, s.logs); err != nil {
-		return nil, err
+	return dirty
+}
+
+func (s *StateDB) baseBalance(addr common.Address) *big.Int {
+	if bal, ok := s.baseBalances[addr]; ok {
+		return bal
 	}
-	s.valid = false
-	return logs, nil
+	return new(big.Int)
+}
+
+func (s *StateDB) baseNonce(addr common.Address) uint64 {
+	return s.baseNonces[addr]
 }
 
 // Logs returns the logs emitted so far in this execution state.
@@ -154,6 +234,13 @@ func (s *StateDB) getOrCreate(addr common.Address) *Account {
 }
 
 func (s *StateDB) touchAccount(addr common.Address) {
+	if _, ok := s.touchedAccounts[addr]; ok {
+		return
+	}
+	// Journal the touch so a revert also undoes the commit marker;
+	// otherwise a rolled-back write would still be committed (with its
+	// stale pre-write value) and could clobber a concurrent commit.
+	s.journal.append(touchAccountChange{account: addr})
 	s.touchedAccounts[addr] = struct{}{}
 }
 
@@ -163,6 +250,10 @@ func (s *StateDB) touchSlot(addr common.Address, key common.Hash) {
 		slots = make(map[common.Hash]struct{})
 		s.touchedSlots[addr] = slots
 	}
+	if _, ok := slots[key]; ok {
+		return
+	}
+	s.journal.append(touchSlotChange{account: addr, slot: key})
 	slots[key] = struct{}{}
 }
 

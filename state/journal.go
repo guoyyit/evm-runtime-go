@@ -139,3 +139,24 @@ func (ch addLogChange) revert(s *StateDB) {
 		s.logs = s.logs[:len(s.logs)-1]
 	}
 }
+
+// touchAccountChange undoes marking an account for commit.
+type touchAccountChange struct {
+	account common.Address
+}
+
+func (ch touchAccountChange) revert(s *StateDB) {
+	delete(s.touchedAccounts, ch.account)
+}
+
+// touchSlotChange undoes marking a storage slot for commit.
+type touchSlotChange struct {
+	account common.Address
+	slot    common.Hash
+}
+
+func (ch touchSlotChange) revert(s *StateDB) {
+	if slots, ok := s.touchedSlots[ch.account]; ok {
+		delete(slots, ch.slot)
+	}
+}

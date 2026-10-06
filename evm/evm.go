@@ -93,6 +93,7 @@ func (e *EVM) Call(caller, addr common.Address, input []byte, gas uint64, value 
 	}
 
 	snapshot := e.StateDB.Snapshot()
+	refundSnap := e.refund
 	if !e.StateDB.Exist(addr) {
 		if value.Sign() != 0 || !e.isPrecompile(addr) {
 			e.StateDB.CreateAccount(addr)
@@ -100,18 +101,21 @@ func (e *EVM) Call(caller, addr common.Address, input []byte, gas uint64, value 
 	}
 	if err := e.transfer(caller, addr, value); err != nil {
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 		return nil, gas, err
 	}
 
 	if precompile, ok := e.precompiles[addr]; ok {
 		if gas < precompile.RequiredGas(input) {
 			e.StateDB.Revert(snapshot)
+			e.refund = refundSnap
 			return nil, gas, ErrOutOfGas
 		}
 		gas -= precompile.RequiredGas(input)
 		output, err := precompile.Run(input)
 		if err != nil {
 			e.StateDB.Revert(snapshot)
+			e.refund = refundSnap
 			return nil, gas, nil
 		}
 		return output, gas, nil
@@ -133,7 +137,10 @@ func (e *EVM) Call(caller, addr common.Address, input []byte, gas uint64, value 
 	gas = contract.Gas
 
 	if err != nil {
+		// A reverted or halted child frame loses everything it did,
+		// including the gas refunds it accumulated.
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 	}
 	return output, gas, err
 }
@@ -152,8 +159,10 @@ func (e *EVM) CallCode(caller, addr common.Address, input []byte, gas uint64, va
 	}
 
 	snapshot := e.StateDB.Snapshot()
+	refundSnap := e.refund
 	if err := e.transfer(caller, caller, value); err != nil {
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 		return nil, gas, err
 	}
 
@@ -172,6 +181,7 @@ func (e *EVM) CallCode(caller, addr common.Address, input []byte, gas uint64, va
 	gas = contract.Gas
 	if err != nil {
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 	}
 	return output, gas, err
 }
@@ -185,16 +195,19 @@ func (e *EVM) DelegateCall(parent *Contract, addr common.Address, input []byte, 
 	}
 
 	snapshot := e.StateDB.Snapshot()
+	refundSnap := e.refund
 
 	if precompile, ok := e.precompiles[addr]; ok {
 		if gas < precompile.RequiredGas(input) {
 			e.StateDB.Revert(snapshot)
+			e.refund = refundSnap
 			return nil, gas, ErrOutOfGas
 		}
 		gas -= precompile.RequiredGas(input)
 		output, err := precompile.Run(input)
 		if err != nil {
 			e.StateDB.Revert(snapshot)
+			e.refund = refundSnap
 			return nil, gas, nil
 		}
 		return output, gas, nil
@@ -215,6 +228,7 @@ func (e *EVM) DelegateCall(parent *Contract, addr common.Address, input []byte, 
 	gas = contract.Gas
 	if err != nil {
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 	}
 	return output, gas, err
 }
@@ -226,15 +240,18 @@ func (e *EVM) StaticCall(caller, addr common.Address, input []byte, gas uint64) 
 	}
 
 	snapshot := e.StateDB.Snapshot()
+	refundSnap := e.refund
 	if precompile, ok := e.precompiles[addr]; ok {
 		if gas < precompile.RequiredGas(input) {
 			e.StateDB.Revert(snapshot)
+			e.refund = refundSnap
 			return nil, gas, ErrOutOfGas
 		}
 		gas -= precompile.RequiredGas(input)
 		output, err := precompile.Run(input)
 		if err != nil {
 			e.StateDB.Revert(snapshot)
+			e.refund = refundSnap
 			return nil, gas, nil
 		}
 		return output, gas, nil
@@ -255,6 +272,7 @@ func (e *EVM) StaticCall(caller, addr common.Address, input []byte, gas uint64) 
 	gas = contract.Gas
 	if err != nil {
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 	}
 	return output, gas, err
 }
@@ -290,6 +308,7 @@ func (e *EVM) create(caller common.Address, initCode []byte, gas uint64, value *
 	}
 
 	snapshot := e.StateDB.Snapshot()
+	refundSnap := e.refund
 	if !isCreate2 {
 		// The nonce increment is itself reverted when creation fails.
 		e.StateDB.SetNonce(caller, e.StateDB.GetNonce(caller)+1)
@@ -298,12 +317,14 @@ func (e *EVM) create(caller common.Address, initCode []byte, gas uint64, value *
 	// A contract may not deploy on top of existing code or non-empty storage.
 	if e.StateDB.Exist(addr) && (!e.StateDB.Empty(addr) || len(e.StateDB.GetCode(addr)) > 0) {
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 		return nil, common.Address{}, gas, ErrCreateCollision
 	}
 	e.StateDB.CreateAccount(addr)
 
 	if err := e.transfer(caller, addr, value); err != nil {
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 		return nil, common.Address{}, gas, err
 	}
 
@@ -318,12 +339,14 @@ func (e *EVM) create(caller common.Address, initCode []byte, gas uint64, value *
 
 	if err != nil {
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 		return nil, common.Address{}, gas, err
 	}
 
 	depositCost := GasCodeDeposit * uint64(len(ret))
 	if gas < depositCost {
 		e.StateDB.Revert(snapshot)
+		e.refund = refundSnap
 		return nil, common.Address{}, gas, ErrOutOfGas
 	}
 	gas -= depositCost

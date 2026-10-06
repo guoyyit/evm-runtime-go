@@ -118,8 +118,10 @@ func TestRestartReadCommitted(t *testing.T) {
 	}
 }
 
-// TestGasReported ensures failed execution reports consumed gas and the
-// sentinel error is inspectable via errors.Is.
+// TestGasReported ensures failed execution reports the gas actually consumed
+// and the sentinel error is inspectable via errors.Is. A call that fails
+// before any instruction runs (here: insufficient balance for the value
+// transfer) must report zero consumption rather than the budget cap.
 func TestGasReported(t *testing.T) {
 	r := testRuntime(t)
 	from := common.HexToAddress("0x1111")
@@ -135,7 +137,7 @@ func TestGasReported(t *testing.T) {
 	if !res.Failed || !errors.Is(res.Err, evm.ErrInsufficientBalance) {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	if res.GasUsed != cfg.GasLimit || res.GasLeft != 0 {
-		t.Fatalf("gas accounting on failure: used=%d left=%d", res.GasUsed, res.GasLeft)
+	if res.GasUsed != 0 || res.GasLeft != cfg.GasLimit {
+		t.Fatalf("gas accounting on pre-execution failure: used=%d left=%d", res.GasUsed, res.GasLeft)
 	}
 }
