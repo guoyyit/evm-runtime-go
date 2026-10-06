@@ -106,7 +106,8 @@ func (e *EVM) Call(caller, addr common.Address, input []byte, gas uint64, value 
 	if precompile, ok := e.precompiles[addr]; ok {
 		if gas < precompile.RequiredGas(input) {
 			e.StateDB.Revert(snapshot)
-			return nil, gas, ErrOutOfGas
+			// Out of gas consumes the whole frame budget.
+			return nil, 0, ErrOutOfGas
 		}
 		gas -= precompile.RequiredGas(input)
 		output, err := precompile.Run(input)
@@ -189,7 +190,8 @@ func (e *EVM) DelegateCall(parent *Contract, addr common.Address, input []byte, 
 	if precompile, ok := e.precompiles[addr]; ok {
 		if gas < precompile.RequiredGas(input) {
 			e.StateDB.Revert(snapshot)
-			return nil, gas, ErrOutOfGas
+			// Out of gas consumes the whole frame budget.
+			return nil, 0, ErrOutOfGas
 		}
 		gas -= precompile.RequiredGas(input)
 		output, err := precompile.Run(input)
@@ -229,7 +231,8 @@ func (e *EVM) StaticCall(caller, addr common.Address, input []byte, gas uint64) 
 	if precompile, ok := e.precompiles[addr]; ok {
 		if gas < precompile.RequiredGas(input) {
 			e.StateDB.Revert(snapshot)
-			return nil, gas, ErrOutOfGas
+			// Out of gas consumes the whole frame budget.
+			return nil, 0, ErrOutOfGas
 		}
 		gas -= precompile.RequiredGas(input)
 		output, err := precompile.Run(input)
@@ -324,7 +327,8 @@ func (e *EVM) create(caller common.Address, initCode []byte, gas uint64, value *
 	depositCost := GasCodeDeposit * uint64(len(ret))
 	if gas < depositCost {
 		e.StateDB.Revert(snapshot)
-		return nil, common.Address{}, gas, ErrOutOfGas
+		// Out of gas consumes the whole frame budget.
+		return nil, common.Address{}, 0, ErrOutOfGas
 	}
 	gas -= depositCost
 	e.StateDB.SetCode(addr, ret)

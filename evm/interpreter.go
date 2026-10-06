@@ -1,6 +1,7 @@
 package evm
 
 import (
+	"errors"
 	"math/big"
 
 	"github.com/guoyyit/evm-runtime-go/common"
@@ -27,6 +28,15 @@ func (in *Interpreter) Run(contract *Contract, input []byte, readOnly bool) (ret
 	in.readOnly = readOnly
 	in.returnData = nil
 
+	// Registered before the recover defer so it runs after it: OOG-class
+	// failures (out of gas, gas uint64 overflow) consume the whole frame
+	// budget, while REVERT and other faults keep their remaining gas.
+	defer func() {
+		if err != nil && (errors.Is(err, ErrOutOfGas) || errors.Is(err, ErrGasUintOverflow)) {
+			contract.Gas = 0
+		}
+	}()
+
 	defer func() {
 		if r := recover(); r != nil {
 			if e, ok := r.(error); ok {
@@ -40,7 +50,10 @@ func (in *Interpreter) Run(contract *Contract, input []byte, readOnly bool) (ret
 	code := contract.Code
 	pc := 0
 
-	for {
+	// Running past the last instruction is an implicit STOP: the frame
+	// halts successfully with the gas and state changes accrued so far,
+	// exactly as if a STOP opcode terminated the program.
+	for pc < len(code) {
 		op := OpCode(code[pc])
 
 		// Static gas and stack validation happen before memory expansion.
@@ -92,6 +105,8 @@ func (in *Interpreter) Run(contract *Contract, input []byte, readOnly bool) (ret
 		}
 		pc = nextPC
 	}
+	// pc reached the end of the code: implicit STOP, successful halt.
+	return nil, nil
 }
 
 // useGas deducts amount from the frame gas budget.

@@ -213,6 +213,20 @@ func TestConcurrentDeterminism(t *testing.T) {
 			t.Fatalf("account %d balance = %s", i, bal)
 		}
 	}
+
+	// The shared treasury must reflect every debit: concurrent commits to
+	// the same account merge additively, no update may be lost.
+	wantTreasury := new(big.Int).Mul(big.NewInt(1e18), big.NewInt(1000))
+	for i := 0; i < n; i++ {
+		wantTreasury.Sub(wantTreasury, big.NewInt(int64(1000+i)))
+	}
+	gotTreasury, err := r.Balance(treasury)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTreasury.Cmp(wantTreasury) != 0 {
+		t.Fatalf("treasury balance = %s, want %s (lost update)", gotTreasury, wantTreasury)
+	}
 }
 
 // buildInitCode wraps runtime code into an init code blob that deploys it:

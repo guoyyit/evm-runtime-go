@@ -106,8 +106,28 @@ q, err := rt.Query(runtime.Config{From: caller, To: &contract, GasLimit: 1_000_0
 - `CREATE` 32000，`CREATE2` 额外 `6/字`；部署代码按 200/字节收取。
 - 最大调用深度 1024。
 
-任一层执行超出预算都会整体原子中止，回滚该执行的全部状态修改，
-并通过 `Result.GasUsed/GasLeft/Err` 报告实际消耗与失败原因。
+### 隐式结束
+
+程序计数器越过最后一条指令（包括末尾 `PUSH` 的数据字节被截断的
+情况）时，执行按**隐式 `STOP`** 处理：正常成功结束，不产生异常，
+不额外扣 Gas（与显式 `STOP` 的 0 费用一致），已产生的状态变更与
+资源消耗和显式终止的程序完全相同。空字节码同样立即成功返回。
+
+### 失败与回退时的计量
+
+`Result.GasUsed` / `Result.GasLeft` 永远报告**实际消耗**，不会统一
+记为预算上限，且相同输入下结果稳定可复现：
+
+- `REVERT`：消耗到回退点为止的 Gas，剩余 Gas 照常返还
+  （`GasLeft > 0`），revert payload 随 `Result.ReturnData` 返回。
+- Gas 耗尽（含内存扩展失败、Gas uint64 溢出）：该帧预算全部耗尽，
+  `GasLeft == 0`、`GasUsed == GasLimit`。
+- 非法指令、非法跳转、栈上/下溢、只读写违规等其他故障：报告执行到
+  故障指令为止的实际消耗，剩余 Gas 返还。
+- 余额不足、深度超限等在执行任何指令前发生的失败：消耗为 0。
+
+任一层执行失败都会整体原子中止，回滚该执行的全部状态修改，
+失败原因通过 `Result.Err` 以可区分的哨兵错误报告。
 
 ## 错误语义
 
@@ -131,31 +151,68 @@ q, err := rt.Query(runtime.Config{From: caller, To: &contract, GasLimit: 1_000_0
 ## 事务性快照与回滚
 
 `state.StateDB.Snapshot()` 可在执行的任意时点建立回滚点，
-`Revert(id)` 完整恢复此后的栈、内存、存储、账户余额、nonce、代码、
-访问列表以及事件日志（内部用于子调用/创建失败回滚）。
-在相同输入下，回滚后重新执行与首次执行结果完全一致。
+`Revert(id)` 完整恢复此后的全部可变状态，保证范围：
+
+- 账户余额、nonce、合约代码与代码哈希；
+- 已写入的存储槽（包括新增槽的移除）；
+- 账户的存在性——无论是 `CreateAccount` 显式创建，还是转账/写存储
+  时隐式创建的账户，回滚后都恢复到快照时点的（不）存在状态；
+- 访问列表（冷/热标记）、事件日志、自毁标记，以及提交用的
+  touched 账户/槽集合（回滚后不会向存储层提交幻影写入）。
+
+执行栈与内存是每个调用帧私有的临时状态：子调用失败时其栈与内存随
+帧一起销毁，父帧的栈与内存自始不受子帧影响，因此无需也无法回滚；
+在相同输入下重新执行时，每个帧都会重建完全一致的栈与内存。
+
+回滚后用相同输入重新执行，每一步的资源消耗（含依赖账户存在性的
+新建账户费、依赖访问列表的冷/热费用）与最终状态都与首次执行完全
+一致。
 
 ## 持久化与隔离
 
 - 世界状态以单个 JSON 文档落盘，提交采用 `fsync + 原子 rename`，
   跨重启可完整读取账户、余额、nonce、代码、存储与事件日志。
 - 每次执行基于提交状态构建独立的工作副本；未提交的修改对其他执行不可见。
-- 提交按账户/存储键增量合并到最新已提交状态，因此多个并发执行
-  在互不冲突的账户上可以安全交错提交；提交本身由互斥锁串行化。
+- 提交在存储锁内原子地合并到最新已提交状态（合并与落盘是一个临界区），
+  因此多个并发执行可以安全地交错提交，且合并语义与提交顺序无关（见下）。
 
 ## 并发与确定性
 
 - 各执行拥有独立的 `StateDB`/栈/内存，互不共享可变状态。
+- 提交按**增量**合并，保证同一账户上的并发提交不丢失更新：
+  - 余额与 nonce 以相对执行基线的**有符号增量**合并，加法可交换，
+    因此并发转账/扣款的最终结果与串行执行的理论值一致，
+    与交错方式、提交顺序无关；
+  - 存储槽按键逐槽合并（同一槽并发写时后提交者覆盖，等价于某种
+    串行顺序）；合约代码仅在本执行真正部署过时才参与合并，
+    避免无关提交覆盖他人部署的代码；
+  - 若增量合并会使账户余额或 nonce 变为负数（并发透支），该次提交
+    被拒绝并返回 `state.ErrBalanceUnderflow` /
+    `state.ErrNonceUnderflow`，已提交状态不受影响——等价于串行
+    执行中该笔交易因余额不足而失败。
 - 相同初始状态与输入，无论并发执行顺序如何，提交后最终状态一致；
-  `TestReplayDeterminism` 通过逐字节比对两次独立运行的状态文件验证。
+  `TestReplayDeterminism` 通过逐字节比对两次独立运行的状态文件验证，
+  `TestConcurrentSameAccountCommits` /
+  `TestConcurrentSameAccountStorage` 以数百次并发提交校验同一账户的
+  余额与存储等于串行理论值。
 - 环境数据（区块号、时间戳、chainID 等）必须由调用方在 `BlockContext`
   中显式提供；未知历史区块的 `BLOCKHASH` 确定性返回零，不依赖任何
   外部随机源或网络。
+
+### 验证方法
+
+```sh
+go test -race ./...
+```
+
+带竞态检测的全量测试必须无数据竞争报告；并发一致性用例不依赖
+偶然时序，重复执行（如 `-count=5`）结果稳定。
 
 ## 测试
 
 ```sh
 go test ./...
+go test -race ./...   # 并发场景须带竞态检测
 ```
 
 覆盖：算术/位运算、非法操作码、非法跳转、栈上/下溢、Gas 耗尽与
@@ -165,3 +222,22 @@ Keccak 向量交叉验证）、ecrecover 往返、快照/回滚、重启恢复�
 并发交错确定性以及 200 组随机字节码（要求不 panic、返回可判定错误）。
 另含一个 Go fuzz 目标 `FuzzBytecodeNeverPanics`，已用数千个随机输入验证
 不 panic；以及存储清零退款、内存偏移溢出（`ErrGasUintOverflow`）等边界。
+
+针对边界与并发语义的专项验收：
+
+- 隐式结束：无 `STOP`/`RETURN`/`REVERT` 结尾的字节码（含末尾 `PUSH`
+  截断、无终止指令的 init code）按成功处理，Gas 与状态变更和显式
+  终止的孪生程序逐项一致（`TestImplicitHaltSuccess` /
+  `TestImplicitHaltCreate`）。
+- 失败计量：`REVERT` 报告实际消耗而非预算上限，OOG 耗尽全部预算，
+  非法指令/栈异常按实际消耗报告且彼此可区分，相同输入重复执行计量
+  稳定（`TestRevertGasMetering` / `TestFailureGasMetering`）。
+- 回滚完整性：异构变更（余额/nonce/代码/存储/访问列表/日志/隐式
+  创建账户/touched 集合）回滚后完整复原，重放结果与首次一致；
+  嵌套回滚后的提交不泄漏幻影账户（`TestRollbackRestoresFullState` /
+  `TestRollbackRestoresImplicitAccounts` /
+  `TestNestedRevertRollbackConsistency` / `TestRetouchAfterRollback`）。
+- 并发提交：同一账户 400 次并发转账提交与 300 次并发存储写入，
+  最终余额/存储等于串行理论值（`TestConcurrentSameAccountCommits` /
+  `TestConcurrentSameAccountStorage`），并由 `go test -race ./...`
+  保证无数据竞争。

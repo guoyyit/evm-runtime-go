@@ -80,6 +80,16 @@ func (ch codeChange) revert(s *StateDB) {
 	}
 }
 
+// codeDirtyChange restores the code-dirty commit marker on rollback.
+type codeDirtyChange struct {
+	account common.Address
+	prev    bool
+}
+
+func (ch codeDirtyChange) revert(s *StateDB) {
+	s.codeDirty[ch.account] = ch.prev
+}
+
 type storageChange struct {
 	account common.Address
 	key     common.Hash
@@ -107,6 +117,34 @@ func (ch createObjectChange) revert(s *StateDB) {
 	delete(s.accounts, ch.account)
 	delete(s.storage, ch.account)
 	delete(s.code, ch.account)
+}
+
+// touchAccountChange records the first time an account entered the
+// touched set, so a revert can restore the set to the snapshot point.
+type touchAccountChange struct {
+	account common.Address
+}
+
+func (ch touchAccountChange) revert(s *StateDB) {
+	delete(s.touchedAccounts, ch.account)
+}
+
+// touchSlotChange records the first time a storage slot entered the
+// touched set for an account.
+type touchSlotChange struct {
+	account common.Address
+	key     common.Hash
+}
+
+func (ch touchSlotChange) revert(s *StateDB) {
+	slots, ok := s.touchedSlots[ch.account]
+	if !ok {
+		return
+	}
+	delete(slots, ch.key)
+	if len(slots) == 0 {
+		delete(s.touchedSlots, ch.account)
+	}
 }
 
 type suicideChange struct {

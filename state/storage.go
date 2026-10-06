@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -20,6 +21,20 @@ type PersistedAccount struct {
 	Code     []byte            `json:"code,omitempty"`
 }
 
+// AccountDelta is one account's committed change relative to the base
+// revision the executing StateDB was loaded from. Balance and nonce are
+// signed deltas so that concurrent executions writing the same account
+// merge additively instead of overwriting each other; storage slots and
+// code are absolute values merged per key (last committer wins per key).
+type AccountDelta struct {
+	BalanceDelta *big.Int
+	NonceDelta   int64
+	CodeSet      bool
+	CodeHash     common.Hash
+	Code         []byte
+	Storage      map[string]string
+}
+
 // persistedData is the serialized world-state document.
 type persistedData struct {
 	Revision int                                 `json:"revision"`
@@ -33,7 +48,7 @@ const zeroHashHex = "0x000000000000000000000000000000000000000000000000000000000
 // Store provides durable, isolated world-state persistence.
 type Store interface {
 	Load() (*persistedData, error)
-	Commit(accounts map[common.Address]*PersistedAccount, suicides map[common.Address]struct{}, logs []Log) (int, error)
+	Commit(deltas map[common.Address]*AccountDelta, suicides map[common.Address]struct{}, logs []Log) (int, error)
 	Revision() int
 	GetLogs() ([]Log, error)
 	Close() error
@@ -81,7 +96,22 @@ func (f *FileStore) Load() (*persistedData, error) {
 	return &data, nil
 }
 
-func (f *FileStore) Commit(accounts map[common.Address]*PersistedAccount, suicides map[common.Address]struct{}, logs []Log) (int, error) {
+// ErrBalanceUnderflow is returned when merging a commit would drive an
+// account balance below zero: the concurrent executions overdraft the
+// account relative to one another, so this commit is rejected (the caller
+// may re-execute on the newer base and retry). No state is changed.
+var ErrBalanceUnderflow = errors.New("state: concurrent commit would drive balance negative")
+
+// ErrNonceUnderflow is returned when merging a commit would drive an
+// account nonce below zero.
+var ErrNonceUnderflow = errors.New("state: concurrent commit would drive nonce negative")
+
+// Commit merges one execution's account deltas into the latest committed
+// state. Balance and nonce deltas apply additively so concurrent commits
+// to the same account cannot lose updates; storage slots merge per key and
+// code replaces only when the execution actually set it. The merge and the
+// durable write happen atomically under the store lock.
+func (f *FileStore) Commit(deltas map[common.Address]*AccountDelta, suicides map[common.Address]struct{}, logs []Log) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -89,7 +119,7 @@ func (f *FileStore) Commit(accounts map[common.Address]*PersistedAccount, suicid
 
 	next := persistedData{
 		Revision: newRevision,
-		Accounts: make(map[common.Address]PersistedAccount, len(f.data.Accounts)+len(accounts)),
+		Accounts: make(map[common.Address]PersistedAccount, len(f.data.Accounts)+len(deltas)),
 		Logs:     append(append([]Log(nil), f.data.Logs...), logs...),
 	}
 	for addr, acc := range f.data.Accounts {
@@ -97,19 +127,46 @@ func (f *FileStore) Commit(accounts map[common.Address]*PersistedAccount, suicid
 		copied.Storage = copyStorage(acc.Storage)
 		next.Accounts[addr] = copied
 	}
-	for addr, acc := range accounts {
-		current := next.Accounts[addr]
-		merged := *acc
-		if len(current.Storage) > 0 || len(merged.Storage) > 0 {
-			slots := copyStorage(current.Storage)
-			for k, v := range merged.Storage {
-				if v == zeroHashHex {
-					delete(slots, k)
-					continue
-				}
-				slots[k] = v
+	for addr, d := range deltas {
+		merged := next.Accounts[addr]
+		merged.Storage = copyStorage(merged.Storage)
+
+		balance := new(big.Int)
+		if merged.Balance != "" {
+			if _, ok := balance.SetString(merged.Balance, 10); !ok {
+				return f.data.Revision, fmt.Errorf("state: corrupt committed balance for %s", addr.Hex())
 			}
-			merged.Storage = slots
+		}
+		if d.BalanceDelta != nil {
+			balance.Add(balance, d.BalanceDelta)
+		}
+		if balance.Sign() < 0 {
+			return f.data.Revision, fmt.Errorf("%w: %s", ErrBalanceUnderflow, addr.Hex())
+		}
+		merged.Balance = balance.String()
+
+		nonce := new(big.Int).Add(new(big.Int).SetUint64(merged.Nonce), big.NewInt(d.NonceDelta))
+		if nonce.Sign() < 0 || !nonce.IsUint64() {
+			return f.data.Revision, fmt.Errorf("%w: %s", ErrNonceUnderflow, addr.Hex())
+		}
+		merged.Nonce = nonce.Uint64()
+
+		if d.CodeSet {
+			merged.Code = d.Code
+			merged.CodeHash = d.CodeHash
+		}
+		for k, v := range d.Storage {
+			if merged.Storage == nil {
+				merged.Storage = make(map[string]string)
+			}
+			if v == zeroHashHex {
+				delete(merged.Storage, k)
+				continue
+			}
+			merged.Storage[k] = v
+		}
+		if len(merged.Storage) == 0 {
+			merged.Storage = nil
 		}
 		next.Accounts[addr] = merged
 	}
@@ -169,4 +226,3 @@ func copyStorage(in map[string]string) map[string]string {
 func (f *FileStore) Close() error { return nil }
 
 var _ Store = (*FileStore)(nil)
-var _ = big.NewInt

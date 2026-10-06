@@ -21,6 +21,12 @@ type StateDB struct {
 	code          map[common.Address][]byte
 	originStorage map[common.Address]map[common.Hash]common.Hash
 
+	// baseAccounts captures nonce/balance as loaded from the store, so a
+	// commit can express balance and nonce changes as signed deltas against
+	// the base revision. Deltas merge additively under concurrency.
+	baseAccounts map[common.Address]baseAccount
+	codeDirty    map[common.Address]bool
+
 	accessList map[common.Address]map[common.Hash]struct{}
 	logs       []Log
 
@@ -28,6 +34,12 @@ type StateDB struct {
 
 	touchedAccounts map[common.Address]struct{}
 	touchedSlots    map[common.Address]map[common.Hash]struct{}
+}
+
+// baseAccount is the committed nonce/balance of an account at load time.
+type baseAccount struct {
+	nonce   uint64
+	balance *big.Int
 }
 
 // Log is an emitted contract event.
@@ -52,6 +64,8 @@ func NewStateDB(store Store) (*StateDB, error) {
 		storage:         make(map[common.Address]map[common.Hash]common.Hash),
 		code:            make(map[common.Address][]byte),
 		originStorage:   make(map[common.Address]map[common.Hash]common.Hash),
+		baseAccounts:    make(map[common.Address]baseAccount),
+		codeDirty:       make(map[common.Address]bool),
 		accessList:      make(map[common.Address]map[common.Hash]struct{}),
 		suicides:        make(map[common.Address]bool),
 		touchedAccounts: make(map[common.Address]struct{}),
@@ -63,6 +77,7 @@ func NewStateDB(store Store) (*StateDB, error) {
 			return nil, fmt.Errorf("state: invalid balance for %s: %q", addr.Hex(), pa.Balance)
 		}
 		s.accounts[addr] = &Account{Nonce: pa.Nonce, Balance: bal, CodeHash: pa.CodeHash}
+		s.baseAccounts[addr] = baseAccount{nonce: pa.Nonce, balance: new(big.Int).Set(bal)}
 		if len(pa.Code) > 0 {
 			s.code[addr] = pa.Code
 		}
@@ -95,34 +110,43 @@ func (s *StateDB) Revert(id int) {
 }
 
 // Commit atomically persists pending changes and returns the new logs.
+// Balance and nonce changes are expressed as signed deltas against the
+// base revision this state was loaded from, so concurrent executions
+// writing the same account merge additively instead of losing updates.
 func (s *StateDB) Commit() ([]Log, error) {
 	if !s.valid {
 		return nil, nil
 	}
-	out := make(map[common.Address]*PersistedAccount, len(s.touchedAccounts))
+	out := make(map[common.Address]*AccountDelta, len(s.touchedAccounts))
 	for addr := range s.touchedAccounts {
 		acc := s.accounts[addr]
 		if s.suicides[addr] {
 			continue
 		}
-		pa := &PersistedAccount{
-			Nonce:    acc.Nonce,
-			Balance:  acc.Balance.String(),
-			CodeHash: acc.CodeHash,
+		base := s.baseAccounts[addr]
+		baseBalance := base.balance
+		if baseBalance == nil {
+			baseBalance = new(big.Int)
 		}
-		if code, ok := s.code[addr]; ok {
-			pa.Code = code
+		d := &AccountDelta{
+			BalanceDelta: new(big.Int).Sub(acc.Balance, baseBalance),
+			NonceDelta:   int64(acc.Nonce) - int64(base.nonce),
+		}
+		if s.codeDirty[addr] {
+			d.CodeSet = true
+			d.Code = s.code[addr]
+			d.CodeHash = acc.CodeHash
 		}
 		if touched := s.touchedSlots[addr]; len(touched) > 0 {
-			pa.Storage = make(map[string]string, len(touched))
+			d.Storage = make(map[string]string, len(touched))
 			for k := range touched {
 				v := s.storage[addr][k]
 				// A zero value explicitly clears the committed slot; it is
-				// represented as the empty string and deleted on merge.
-				pa.Storage[k.Hex()] = v.Hex()
+				// represented as the zero hash and deleted on merge.
+				d.Storage[k.Hex()] = v.Hex()
 			}
 		}
-		out[addr] = pa
+		out[addr] = d
 	}
 	logs := append([]Log(nil), s.logs...)
 	suicides := make(map[common.Address]struct{}, len(s.suicides))
@@ -145,6 +169,10 @@ func (s *StateDB) getOrCreate(addr common.Address) *Account {
 	if acc, ok := s.accounts[addr]; ok {
 		return acc
 	}
+	// Journal the implicit creation so a revert restores non-existence;
+	// otherwise a zombie zero account would leak past the rollback point
+	// and change Exist-dependent gas metering on re-execution.
+	s.journal.append(createObjectChange{account: addr})
 	acc := &Account{Balance: new(big.Int)}
 	s.accounts[addr] = acc
 	if s.storage[addr] == nil {
@@ -154,6 +182,10 @@ func (s *StateDB) getOrCreate(addr common.Address) *Account {
 }
 
 func (s *StateDB) touchAccount(addr common.Address) {
+	if _, ok := s.touchedAccounts[addr]; ok {
+		return
+	}
+	s.journal.append(touchAccountChange{account: addr})
 	s.touchedAccounts[addr] = struct{}{}
 }
 
@@ -163,6 +195,10 @@ func (s *StateDB) touchSlot(addr common.Address, key common.Hash) {
 		slots = make(map[common.Hash]struct{})
 		s.touchedSlots[addr] = slots
 	}
+	if _, ok := slots[key]; ok {
+		return
+	}
+	s.journal.append(touchSlotChange{account: addr, key: key})
 	slots[key] = struct{}{}
 }
 
@@ -215,6 +251,8 @@ func (s *StateDB) SetCode(addr common.Address, code []byte) {
 	s.touchAccount(addr)
 	s.journal.append(codeChange{account: addr, prevCode: prev, existed: existed})
 	acc := s.getOrCreate(addr)
+	s.journal.append(codeDirtyChange{account: addr, prev: s.codeDirty[addr]})
+	s.codeDirty[addr] = true
 	if len(code) == 0 {
 		delete(s.code, addr)
 		acc.CodeHash = common.Hash{}
@@ -279,10 +317,7 @@ func (s *StateDB) Empty(addr common.Address) bool {
 }
 
 func (s *StateDB) CreateAccount(addr common.Address) {
-	if _, ok := s.accounts[addr]; ok {
-		return
-	}
-	s.journal.append(createObjectChange{account: addr})
+	// getOrCreate journals the creation, keeping rollback complete.
 	s.getOrCreate(addr)
 }
 

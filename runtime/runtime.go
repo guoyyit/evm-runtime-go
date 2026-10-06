@@ -98,10 +98,13 @@ func (r *Runtime) Execute(cfg Config) (*Result, error) {
 	result.GasUsed = cfg.GasLimit - left
 
 	if runErr != nil {
+		// Report the gas actually consumed, never the flat budget:
+		// REVERT keeps its remaining gas, OOG-class faults consumed it
+		// all (left == 0), and other faults report consumption up to the
+		// failing instruction. The failure reason stays distinguishable
+		// via errors.Is(res.Err, evm.ErrXxx).
 		result.Failed = true
 		result.Err = runErr
-		result.GasUsed = cfg.GasLimit
-		result.GasLeft = 0
 		result.ReturnData = evm.RevertData(runErr)
 		// Discard the working state entirely; nothing is committed.
 		return result, nil
@@ -141,10 +144,9 @@ func (r *Runtime) Query(cfg Config) (*Result, error) {
 	output, left, runErr := ev.StaticCall(cfg.From, *cfg.To, cfg.Data, cfg.GasLimit)
 	result := &Result{ReturnData: output, GasLeft: left, GasUsed: cfg.GasLimit - left}
 	if runErr != nil {
+		// Same metering rule as Execute: actual consumption, not the cap.
 		result.Failed = true
 		result.Err = runErr
-		result.GasUsed = cfg.GasLimit
-		result.GasLeft = 0
 		result.ReturnData = evm.RevertData(runErr)
 	}
 	return result, nil

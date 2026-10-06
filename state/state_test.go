@@ -160,3 +160,138 @@ func TestUncommittedInvisible(t *testing.T) {
 		t.Fatal("uncommitted balance leaked")
 	}
 }
+
+// TestRollbackRestoresImplicitAccounts: accounts created implicitly by
+// balance/storage writes must disappear again on revert, and the touched
+// sets must return to the snapshot point so a later commit writes nothing.
+func TestRollbackRestoresImplicitAccounts(t *testing.T) {
+	db, store := newTestDB(t)
+	fresh := common.Address{0xaa}
+
+	snap := db.Snapshot()
+	db.AddBalance(fresh, big.NewInt(5))                // implicit create
+	db.SetState(fresh, common.Hash{1}, common.Hash{9}) // implicit create + slot
+	db.Revert(snap)
+
+	if db.Exist(fresh) {
+		t.Fatal("implicitly created account survived rollback")
+	}
+	if db.GetBalance(fresh).Sign() != 0 {
+		t.Fatal("balance survived rollback")
+	}
+	if db.GetState(fresh, common.Hash{1}) != (common.Hash{}) {
+		t.Fatal("storage survived rollback")
+	}
+
+	// A commit right after the rollback must be a no-op for accounts.
+	if _, err := db.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loaded.Accounts[fresh]; ok {
+		t.Fatal("rolled-back account was committed")
+	}
+}
+
+// TestRollbackRestoresFullState reverts a batch of heterogeneous mutations
+// and requires the rolled-back state to be indistinguishable from a pristine
+// one, and re-application to reproduce the first execution exactly.
+func TestRollbackRestoresFullState(t *testing.T) {
+	db, _ := newTestDB(t)
+	a := common.Address{0x01}
+	b := common.Address{0x02}
+	db.AddBalance(a, big.NewInt(1000))
+	db.SetNonce(a, 1)
+
+	mutate := func(s *StateDB) {
+		s.SubBalance(a, big.NewInt(300))
+		s.AddBalance(b, big.NewInt(300))
+		s.SetNonce(a, 7)
+		s.SetCode(b, []byte{0x60, 0x00})
+		s.SetState(a, common.Hash{3}, common.Hash{33})
+		s.AddAddressToAccessList(b)
+		s.AddSlotToAccessList(a, common.Hash{3})
+		s.AddLog(Log{Address: a, Data: []byte("x")})
+	}
+
+	snap := db.Snapshot()
+	mutate(db)
+	db.Revert(snap)
+
+	// Every dimension must be back at the snapshot point.
+	if got := db.GetBalance(a); got.Cmp(big.NewInt(1000)) != 0 {
+		t.Fatalf("a balance = %s", got)
+	}
+	if db.Exist(b) {
+		t.Fatal("b must not exist after rollback")
+	}
+	if got := db.GetNonce(a); got != 1 {
+		t.Fatalf("a nonce = %d", got)
+	}
+	if got := db.GetState(a, common.Hash{3}); got != (common.Hash{}) {
+		t.Fatalf("slot 3 = %s", got.Hex())
+	}
+	if db.IsAddressWarm(b) || db.IsSlotWarm(a, common.Hash{3}) {
+		t.Fatal("access list entries survived rollback")
+	}
+	if len(db.Logs()) != 0 {
+		t.Fatal("logs survived rollback")
+	}
+
+	// Re-executing the same mutations reproduces the first run exactly.
+	mutate(db)
+	if got := db.GetBalance(a); got.Cmp(big.NewInt(700)) != 0 {
+		t.Fatalf("re-applied a balance = %s", got)
+	}
+	if got := db.GetBalance(b); got.Cmp(big.NewInt(300)) != 0 {
+		t.Fatalf("re-applied b balance = %s", got)
+	}
+	if got := db.GetNonce(a); got != 7 {
+		t.Fatalf("re-applied nonce = %d", got)
+	}
+	if got := db.GetState(a, common.Hash{3}); got != (common.Hash{33}) {
+		t.Fatalf("re-applied slot 3 = %s", got.Hex())
+	}
+	if len(db.Logs()) != 1 {
+		t.Fatal("re-applied log missing")
+	}
+}
+
+// TestConcurrentCommitMergesCodeAndBalance: an execution that loaded its
+// base before a concurrent code deployment must not erase that code when it
+// commits an unrelated balance change afterwards.
+func TestConcurrentCommitMergesCodeAndBalance(t *testing.T) {
+	db1, store := newTestDB(t)
+	x := common.Address{0xcc}
+
+	// db2 deploys code to X and commits first.
+	db2, err := NewStateDB(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db2.CreateAccount(x)
+	db2.SetCode(x, []byte{0x60, 0x00})
+	if _, err := db2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// db1 still works from the older base and only moves balance.
+	db1.AddBalance(x, big.NewInt(42))
+	if _, err := db1.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	check, err := NewStateDB(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(check.GetCode(x)) != string([]byte{0x60, 0x00}) {
+		t.Fatalf("concurrent balance commit erased code: %x", check.GetCode(x))
+	}
+	if check.GetBalance(x).Cmp(big.NewInt(42)) != 0 {
+		t.Fatalf("balance = %s, want 42", check.GetBalance(x))
+	}
+}
